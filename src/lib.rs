@@ -22,38 +22,38 @@ fn truncate(s: &str, max: usize) -> String {
 
 // Структуры для данных (с добавлением времен)
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct RequestData {
-    method: String,
-    endpoint: String,
-    headers: HashMap<String, String>,
-    body: Option<String>,  // JSON/form/multipart как строка, если возможно; для stream - None
-    cookies: HashMap<String, String>,  // Куки, отправленные в запросе
-    request_time: String,  // Время отправки запроса в МСК (RFC3339)
+pub struct RequestData {
+    pub method: String,
+    pub endpoint: String,
+    pub headers: HashMap<String, String>,
+    pub body: Option<String>,  // JSON/form/multipart как строка, если возможно; для stream - None
+    pub cookies: HashMap<String, String>,  // Куки, отправленные в запросе
+    pub request_time: String,  // Время отправки запроса в МСК (RFC3339)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct ResponseData {
-    status: u16,
-    headers: HashMap<String, String>,
-    body: String,
-    set_cookies: Vec<String>,  // Set-Cookie headers для обновленных куки
-    response_time: String,  // Время получения ответа в МСК (RFC3339)
-    duration_ms: u64,  // Длительность выполнения запроса в миллисекундах
+pub struct ResponseData {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: String,
+    pub set_cookies: Vec<String>,  // Set-Cookie headers для обновленных куки
+    pub response_time: String,  // Время получения ответа в МСК (RFC3339)
+    pub duration_ms: u64,  // Длительность выполнения запроса в миллисекундах
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-struct RequestResponseData {
-    request_data: RequestData,
-    response_data: Option<ResponseData>,
-    error: Option<String>,
-    cookies: Option<String>,  // JSON-массив куки после запроса
+pub struct RequestResponseData {
+    pub request_data: RequestData,
+    pub response_data: Option<ResponseData>,
+    pub error: Option<String>,
+    pub cookies: Option<String>,  // JSON-массив куки после запроса
 }
 
 // Обертка клиента с новым CookieStore
 pub struct TrackedClient {
-    inner: Client,
-    collector: Arc<Mutex<HashMap<String, RequestResponseData>>>,
-    cookie_store: Arc<CookieStoreMutex>,
+    pub inner: Client,
+    pub collector: Arc<Mutex<HashMap<String, RequestResponseData>>>,
+    pub cookie_store: Arc<CookieStoreMutex>,
 }
 
 impl TrackedClient {
@@ -105,7 +105,7 @@ impl TrackedClient {
         let proxy_http = Proxy::http(&proxy)?;
         let proxy_https = Proxy::https(&proxy)?;
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(10))
             .cookie_provider(jar.clone())
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
             .proxy(proxy_http)
@@ -118,7 +118,7 @@ impl TrackedClient {
             cookie_store: jar,
         })
     }
-    
+
     pub fn dump_cookies(&self) -> Result<String> {
         let store = self.cookie_store.lock().map_err(|e| anyhow!("Lock error: {}", e))?;
 
