@@ -151,6 +151,9 @@ impl TrackedClient {
 
     // теперь возвращает ResponseData для дальнейшего использования
     pub async fn tracked_send(&self, key: &str, builder: RequestBuilder) -> Result<Response> {
+        // === NEW: пробуем заранее сделать клон билдерa, чтобы потом вернуть «свежий» Response ===
+        let builder_for_return = builder.try_clone();
+
         // --- подготовка RequestData как раньше ---
         let mut req = builder
             .build()
@@ -159,12 +162,13 @@ impl TrackedClient {
         let request_time = Utc::now().with_timezone(&msk).to_rfc3339();
         let method = req.method().as_str().to_string();
         let endpoint = req.url().to_string();
-        let headers: HashMap<_,_> = req
+        let headers: HashMap<_, _> = req
             .headers()
             .iter()
-            .map(|(k,v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let body = req.body()
+        let body = req
+            .body()
             .and_then(|b| b.as_bytes())
             .map(|b| String::from_utf8_lossy(b).to_string());
         // куки, отправленные в запросе
@@ -209,9 +213,9 @@ impl TrackedClient {
 
         // --- сбор метаданных ответа ---
         let status = resp.status().as_u16();
-        let resp_headers: HashMap<_,_> = resp.headers()
+        let resp_headers: HashMap<_, _> = resp.headers()
             .iter()
-            .map(|(k,v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
         let set_cookies: Vec<_> = resp
             .headers()
@@ -220,14 +224,42 @@ impl TrackedClient {
             .filter_map(|v| v.to_str().ok().map(str::to_string))
             .collect();
 
-        // обновляем collector (без чтения тела)
+        // === NEW: если можем заново отправить такой же запрос — читаем body сейчас и логируем ===
+        if let Some(builder2) = builder_for_return {
+            // Читаем body для логирования
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_string = String::from_utf8_lossy(&body_bytes).to_string();
+
+            {
+                let mut coll = self.collector.lock().await;
+                if let Some(ent) = coll.get_mut(key) {
+                    ent.response_data = Some(ResponseData {
+                        status,
+                        headers: resp_headers,
+                        body: body_string,
+                        set_cookies,
+                        response_time: response_time.clone(),
+                        duration_ms,
+                    });
+                    ent.cookies = Some(self.dump_cookies()?);
+                }
+            }
+
+            // Возвращаем «родной» Response вторым запросом (идемпотентные запросы — ОК)
+            let req2 = builder2.build().context("Failed to build cloned request")?;
+            let resp2 = self.inner.execute(req2).await
+                .context("Failed to re-execute request for returned Response")?;
+            return Ok(resp2);
+        }
+
+        // === Fallback (как раньше): не можем клонировать запрос — не читаем body, чтобы не сломать вызывающего ===
         {
             let mut coll = self.collector.lock().await;
             if let Some(ent) = coll.get_mut(key) {
                 ent.response_data = Some(ResponseData {
                     status,
                     headers: resp_headers,
-                    body: String::new(),        // тело не логируем
+                    body: String::new(), // тут body НЕ читаем, иначе «съедим» поток
                     set_cookies,
                     response_time: response_time.clone(),
                     duration_ms,
@@ -236,7 +268,6 @@ impl TrackedClient {
             }
         }
 
-        // возвращаем оригинальный Response для дальнейшей обработки
         Ok(resp)
     }
 
@@ -293,7 +324,7 @@ impl TrackedClient {
 }
 
 pub async fn example_step(client: &TrackedClient, step_id: &str) -> Result<()> {
-    let builder = client.inner.get("https://httpbin.org/cookies/set?test=1");
+    let builder = client.inner.get("https://httpbin.org/ip");
     let resp = client.tracked_send(&format!("step_{}", step_id), builder).await?;
     println!("Response status: {}", resp.status());
     let pretty = client.get_pretty_truncated_data().await?;
