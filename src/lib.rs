@@ -69,7 +69,6 @@ impl TrackedClient {
             cookie_store: store,
         })
     }
-
     pub async fn from_redis_cookies(
         proxy: String,
         cookie_json: &str,
