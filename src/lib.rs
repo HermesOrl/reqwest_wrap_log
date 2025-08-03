@@ -3,86 +3,95 @@ use reqwest::header::HeaderMap;
 use reqwest_cookie_store::CookieStoreMutex;
 use cookie_store::{CookieStore, Cookie};
 use serde::{Deserialize, Serialize};
-use serde_json;
+use serde_json::{self, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::error::Error;
 use std::time::Instant;
 use chrono::{Utc, FixedOffset};
 use std::io::Cursor;
+use anyhow::{anyhow, Result};
+
+// Функция для усечения строки до max символов
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() > max {
+        format!("{}...", &s[0..max-3])
+    } else {
+        s.to_string()
+    }
+}
 
 // Структуры для данных (с добавлением времен)
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RequestData {
-    pub method: String,
-    pub endpoint: String,
-    pub headers: HashMap<String, String>,
-    pub body: Option<String>,  // JSON/form/multipart как строка, если возможно; для stream - None
-    pub cookies: HashMap<String, String>,  // Куки, отправленные в запросе
-    pub request_time: String,  // Время отправки запроса в МСК (RFC3339)
+struct RequestData {
+    method: String,
+    endpoint: String,
+    headers: HashMap<String, String>,
+    body: Option<String>,  // JSON/form/multipart как строка, если возможно; для stream - None
+    cookies: HashMap<String, String>,  // Куки, отправленные в запросе
+    request_time: String,  // Время отправки запроса в МСК (RFC3339)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ResponseData {
-    pub status: u16,
-    pub headers: HashMap<String, String>,
-    pub body: String,
-    pub set_cookies: Vec<String>,  // Set-Cookie headers для обновленных куки
-    pub response_time: String,  // Время получения ответа в МСК (RFC3339)
-    pub duration_ms: u64,  // Длительность выполнения запроса в миллисекундах
+struct ResponseData {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: String,
+    set_cookies: Vec<String>,  // Set-Cookie headers для обновленных куки
+    response_time: String,  // Время получения ответа в МСК (RFC3339)
+    duration_ms: u64,  // Длительность выполнения запроса в миллисекундах
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct RequestResponseData {
-    pub request_data: RequestData,
-    pub response_data: Option<ResponseData>,  // Option на случай ошибки
-    pub error: Option<String>,  // Если запрос упал
+struct RequestResponseData {
+    request_data: RequestData,
+    response_data: Option<ResponseData>,
+    error: Option<String>,
+    cookies: Option<String>,  // JSON-массив куки после запроса
 }
 
 // Обертка клиента с новым CookieStore
 pub struct TrackedClient {
-    pub inner: Client,
-    pub collector: Arc<Mutex<HashMap<String, RequestResponseData>>>,
-    pub cookie_store: Arc<CookieStoreMutex>,
+    inner: Client,
+    collector: Arc<Mutex<HashMap<String, RequestResponseData>>>,
+    cookie_store: Arc<CookieStoreMutex>,
 }
 
 impl TrackedClient {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let store = Arc::new(CookieStoreMutex::new(CookieStore::new(None)));
         let client = Client::builder()
             .cookie_provider(store.clone())
-            .build()
-            .unwrap();
+            .build()?;
 
-        TrackedClient {
+        Ok(TrackedClient {
             inner: client,
             collector: Arc::new(Mutex::new(HashMap::new())),
             cookie_store: store,
-        }
+        })
     }
 
     pub async fn from_redis_cookies(
         _email: String,
         _password: String,
         proxy: String,
-        cookie_json: &str,                   // передаём строку (из кеша!)
-    ) -> Result<Self, Box<dyn Error>> {
-        // 1. Десериализуем cookies
+        cookie_json: &str,
+    ) -> Result<Self> {
+        // Десериализуем cookies
         let reader = Cursor::new(cookie_json);
-        let store = CookieStore::load_json_all(reader).map_err(|e| e as Box<dyn Error>)?;
-        let jar = Arc::new(CookieStoreMutex::new(store));
+        let store_inner = CookieStore::load_json_all(reader)
+            .map_err(|e| anyhow!("Failed to load cookies JSON: {}", e))?;
+        let jar = Arc::new(CookieStoreMutex::new(store_inner));
 
-        // 2. Собираем клиент с нужным прокси
-        let mut client_builder = Client::builder()
+        // Собираем клиент с прокси
+        let proxy_http = Proxy::http(&proxy)?;
+        let proxy_https = Proxy::https(&proxy)?;
+        let client = Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .cookie_provider(jar.clone())
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
-
-        let proxy_http  = Proxy::http(&proxy)?;
-        let proxy_https = Proxy::https(&proxy)?;
-        client_builder = client_builder.proxy(proxy_http).proxy(proxy_https);
-
-        let client = client_builder.build().map_err(|e| Box::new(e) as Box<dyn Error>)?;
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+            .proxy(proxy_http)
+            .proxy(proxy_https)
+            .build()?;
 
         Ok(TrackedClient {
             inner: client,
@@ -91,141 +100,133 @@ impl TrackedClient {
         })
     }
 
-    // Универсальный метод для tracked send: принимает готовый RequestBuilder
-    pub async fn tracked_send(&self, key: &str, builder: RequestBuilder) -> Result<(), Box<dyn Error>> {
-        let mut req = builder.build()?;
+    pub fn dump_cookies(&self) -> Result<String> {
+        let store = self.cookie_store.lock().map_err(|e| anyhow!("Lock error: {}", e))?;
 
-        // Время перед трекингом (примерно время отправки)
-        let msk_offset = FixedOffset::east_opt(3 * 3600).unwrap();
-        let request_time = Utc::now().with_timezone(&msk_offset).to_rfc3339();
+        // Сохраняем все куки в JSON-буфер
+        let mut buf: Vec<u8> = Vec::new();
+        store.save_incl_expired_and_nonpersistent_json(&mut buf)
+            .map_err(|e| anyhow!("save_json failed: {}", e))?;
+
+        let raw = String::from_utf8(buf).map_err(|e| anyhow!("UTF-8 error: {}", e))?;
+        // Разбиваем по строкам и собираем единый JSON-массив
+        let mut arr: Vec<Value> = Vec::new();
+        for line in raw.lines() {
+            if line.trim().is_empty() { continue; }
+            let v: Value = serde_json::from_str(line)
+                .map_err(|e| anyhow!("Invalid cookie JSON line: {}", e))?;
+            arr.push(v);
+        }
+        Ok(serde_json::to_string(&arr)?)
+    }
+
+    pub async fn tracked_send(&self, key: &str, builder: RequestBuilder) -> Result<()> {
+        let mut req = builder.build()?;
+        let msk = FixedOffset::east_opt(3 * 3600).unwrap();
+        let request_time = Utc::now().with_timezone(&msk).to_rfc3339();
 
         let method = req.method().as_str().to_string();
         let endpoint = req.url().to_string();
-        let headers: HashMap<String, String> = req.headers().iter()
+        let headers = req.headers().iter()
             .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
         let body = req.body().and_then(|b| b.as_bytes()).map(|b| String::from_utf8_lossy(b).to_string());
 
-        // Cookies из store для этого URL
         let url = req.url().clone();
-        let cookies_sent: HashMap<String, String> = {
+        let cookies_sent = {
             let store = self.cookie_store.lock().unwrap();
             store.get_request_cookies(&url)
-                .map(|cookie| (cookie.name().to_string(), cookie.value().to_string()))
+                .map(|c| (c.name().to_string(), c.value().to_string()))
                 .collect()
         };
 
-        let data = RequestData {
-            method,
-            endpoint,
-            headers,
-            body,
-            cookies: cookies_sent,
-            request_time,
-        };
+        let data = RequestData { method, endpoint, headers, body, cookies: cookies_sent, request_time };
+        {
+            let mut coll = self.collector.lock().unwrap();
+            coll.insert(key.to_string(), RequestResponseData {
+                request_data: data,
+                response_data: None,
+                error: None,
+                cookies: None,
+            });
+        }
 
-        let mut collector = self.collector.lock().unwrap();
-        collector.insert(key.to_string(), RequestResponseData {
-            request_data: data,
-            response_data: None,
-            error: None,
-        });
-        drop(collector);  // Освободить lock перед await
-
-        // Измеряем время выполнения
         let start = Instant::now();
-
-        // Отправляем запрос
         let response = self.inner.execute(req).await;
-
         let duration_ms = start.elapsed().as_millis() as u64;
+        let response_time = Utc::now().with_timezone(&msk).to_rfc3339();
 
-        let response_time = Utc::now().with_timezone(&msk_offset).to_rfc3339();
-
-        // Теперь обрабатываем ответ и трекаем
-        let mut collector = self.collector.lock().unwrap();
-        if let Some(entry) = collector.get_mut(key) {
+        let mut coll = self.collector.lock().unwrap();
+        if let Some(entry) = coll.get_mut(key) {
             match response {
                 Ok(mut resp) => {
                     let status = resp.status().as_u16();
-                    let headers: HashMap<String, String> = resp.headers().iter()
+                    let headers = resp.headers().iter()
                         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
                         .collect();
-
-                    // Set-Cookie headers для обновленных куки
-                    let set_cookies: Vec<String> = resp.headers().get_all("set-cookie")
-                        .iter()
-                        .map(|v| v.to_str().unwrap_or("").to_string())
-                        .collect();
-
+                    let set_cookies = resp.headers().get_all("set-cookie")
+                        .iter().map(|v| v.to_str().unwrap_or("").to_string()).collect();
                     let body = resp.text().await.unwrap_or_default();
 
-                    entry.response_data = Some(ResponseData {
-                        status,
-                        headers,
-                        body,
-                        set_cookies,
-                        response_time,
-                        duration_ms,
-                    });
+                    entry.response_data = Some(ResponseData { status, headers, body, set_cookies, response_time, duration_ms });
                 }
                 Err(e) => {
                     entry.error = Some(e.to_string());
-                    return Err(Box::new(e));
+                    return Err(anyhow!(e));
                 }
             }
+            entry.cookies = Some(self.dump_cookies()?);
         }
-
         Ok(())
     }
 
-    // Получить собранные данные и сериализовать
     pub fn get_collected_data(&self) -> String {
-        let collector = self.collector.lock().unwrap();
-        serde_json::to_string(&*collector).unwrap()
+        let coll = self.collector.lock().unwrap();
+        serde_json::to_string(&*coll).unwrap()
     }
 
-    // Очистить коллектор после отправки
+    pub fn get_pretty_truncated_data(&self) -> String {
+        let json_data = self.get_collected_data();
+        let mut data: Value = serde_json::from_str(&json_data).unwrap();
+
+        fn truncate_fields(value: &mut Value) {
+            match value {
+                Value::Object(map) => {
+                    for v in map.values_mut() { truncate_fields(v); }
+                    if let Some(Value::Object(hdrs)) = map.get_mut("headers") {
+                        for inner in hdrs.values_mut() {
+                            if let Value::String(s) = inner { *s = truncate(s, 50); }
+                        }
+                    }
+                    if let Some(Value::String(s)) = map.get_mut("cookies") {
+                        *s = truncate(s, 500);
+                    }
+                    if let Some(Value::Array(arr)) = map.get_mut("set_cookies") {
+                        for item in arr { if let Value::String(s) = item { *s = truncate(s, 50); } }
+                    }
+                }
+                Value::Array(arr) => { for v in arr { truncate_fields(v); } }
+                _ => {}
+            }
+        }
+
+        truncate_fields(&mut data);
+        serde_json::to_string_pretty(&data).unwrap()
+    }
+
     pub fn clear_collector(&self) {
-        let mut collector = self.collector.lock().unwrap();
-        collector.clear();
+        let mut coll = self.collector.lock().unwrap();
+        coll.clear();
     }
 }
 
-// Пример использования в шаге (функция в агрегаторе)
-pub async fn example_step(client: &TrackedClient, step_id: &str) -> Result<(), Box<dyn Error>> {
-    // Пример: GET с кастом headers
-    let get_builder = client.inner.get("https://google.com/api1")
-        .header("Custom-Header", "Value")
-        .query(&[("param", "value")]);
-    client.tracked_send(&format!("http_get_1_on_{}", step_id), get_builder).await?;
+// Пример использования
+pub async fn example_step(client: &TrackedClient, step_id: &str) -> Result<()> {
+    let builder = client.inner.get("https://httpbin.org/cookies/set?test=1");
+    client.tracked_send(&format!("step_{}", step_id), builder).await?;
 
-    // Пример: POST с JSON
-    let json_post_builder = client.inner.post("https://google.com/api2")
-        .header("Authorization", "Bearer token")
-        .json(&serde_json::json!({"key": "value"}));
-    client.tracked_send(&format!("http_post_json_on_{}", step_id), json_post_builder).await?;
-
-    // Пример: POST с form data
-    let form_post_builder = client.inner.post("https://google.com/api3")
-        .form(&[("field1", "value1"), ("field2", "value2")]);
-    client.tracked_send(&format!("http_post_form_on_{}", step_id), form_post_builder).await?;
-
-    // Пример: POST с custom body (например, multipart)
-    use reqwest::multipart;
-    let part = multipart::Part::text("file content").file_name("file.txt").mime_str("text/plain")?;
-    let form = multipart::Form::new().part("file", part);
-    let multipart_builder = client.inner.post("https://google.com/upload")
-        .multipart(form);
-    client.tracked_send(&format!("http_post_multipart_on_{}", step_id), multipart_builder).await?;
-
-    // После всех запросов — сериализуем и отправляем в ваш API
     let json_data = client.get_collected_data();
-    // Здесь отправьте json_data в ваш веб API, например:
-    // client.inner.post("your-api-url").body(json_data).send().await?;
-    println!("Collected: {}", json_data);  // Для примера
-
-    client.clear_collector();  // Очистить для следующего шага
-
+    println!("Collected: {}", client.get_pretty_truncated_data());
+    client.clear_collector();
     Ok(())
 }
