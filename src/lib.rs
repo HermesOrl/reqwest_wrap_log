@@ -71,8 +71,6 @@ impl TrackedClient {
     }
 
     pub async fn from_redis_cookies(
-        _email: String,
-        _password: String,
         proxy: String,
         cookie_json: &str,
     ) -> Result<Self> {
@@ -100,6 +98,28 @@ impl TrackedClient {
         })
     }
 
+    pub async fn new_basic(
+        proxy: String,
+        jar:            Arc<CookieStoreMutex>,
+    ) -> Result<Self> {
+        // Десериализуем cookies
+        let proxy_http = Proxy::http(&proxy)?;
+        let proxy_https = Proxy::https(&proxy)?;
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .cookie_provider(jar.clone())
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+            .proxy(proxy_http)
+            .proxy(proxy_https)
+            .build()?;
+
+        Ok(TrackedClient {
+            inner: client,
+            collector: Arc::new(Mutex::new(HashMap::new())),
+            cookie_store: jar,
+        })
+    }
+    
     pub fn dump_cookies(&self) -> Result<String> {
         let store = self.cookie_store.lock().map_err(|e| anyhow!("Lock error: {}", e))?;
 
