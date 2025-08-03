@@ -1,4 +1,4 @@
-use reqwest::{Client, RequestBuilder, Proxy};
+use reqwest::{Client, RequestBuilder, Proxy, Response};
 use reqwest_cookie_store::CookieStoreMutex;
 use cookie_store::CookieStore;
 use serde::{Deserialize, Serialize};
@@ -150,89 +150,94 @@ impl TrackedClient {
     }
 
     // теперь возвращает ResponseData для дальнейшего использования
-    pub async fn tracked_send(&self, key: &str, builder: RequestBuilder) -> Result<ResponseData> {
+    pub async fn tracked_send(&self, key: &str, builder: RequestBuilder) -> Result<Response> {
+        // --- подготовка RequestData как раньше ---
         let mut req = builder
             .build()
             .context("Failed to build request")?;
-
-
-        let msk = FixedOffset::east_opt(3 * 3600)
-            .context("Failed to create MSK timezone offset")?;
+        let msk = FixedOffset::east_opt(3 * 3600).unwrap();
         let request_time = Utc::now().with_timezone(&msk).to_rfc3339();
-
         let method = req.method().as_str().to_string();
         let endpoint = req.url().to_string();
-        let headers = req
+        let headers: HashMap<_,_> = req
             .headers()
             .iter()
-            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .map(|(k,v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let body = req
-            .body()
+        let body = req.body()
             .and_then(|b| b.as_bytes())
             .map(|b| String::from_utf8_lossy(b).to_string());
-
+        // куки, отправленные в запросе
         let url = req.url().clone();
         let cookies_sent = {
             let store = self.cookie_store
                 .lock()
                 .map_err(|e| anyhow!("Cookie store lock error: {}", e))?;
-            store
-                .get_request_cookies(&url)
+            store.get_request_cookies(&url)
                 .map(|c| (c.name().to_string(), c.value().to_string()))
                 .collect()
         };
-
         let req_data = RequestData { method, endpoint, headers, body, cookies: cookies_sent, request_time };
         {
             let mut coll = self.collector.lock().await;
             coll.insert(
                 key.to_string(),
-                RequestResponseData { request_data: req_data.clone(), response_data: None, error: None, cookies: None },
+                RequestResponseData {
+                    request_data: req_data,
+                    response_data: None,
+                    error: None,
+                    cookies: None,
+                },
             );
         }
 
+        // --- отправка и измерение времени ---
         let start = Instant::now();
-        let response = self.inner.execute(req).await;
-        let duration_ms = start.elapsed().as_millis() as u64;
-        let response_time = Utc::now().with_timezone(&msk).to_rfc3339();
-
-        let resp_data = match response {
-            Ok(mut resp) => {
-                let status = resp.status().as_u16();
-                let headers = resp
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-                    .collect();
-                let set_cookies = resp
-                    .headers()
-                    .get_all("set-cookie")
-                    .iter()
-                    .map(|v| v.to_str().unwrap_or("").to_string())
-                    .collect();
-                let body = resp.text().await.context("Failed to read response body")?;
-
-                ResponseData { status, headers, body, set_cookies, response_time, duration_ms }
-            }
+        let resp = match self.inner.execute(req).await {
+            Ok(r) => r,
             Err(e) => {
+                // залогируем ошибку
                 let mut coll = self.collector.lock().await;
-                if let Some(entry) = coll.get_mut(key) {
-                    entry.error = Some(e.to_string());
+                if let Some(ent) = coll.get_mut(key) {
+                    ent.error = Some(e.to_string());
                 }
                 return Err(anyhow!("Request execution failed: {}", e));
             }
         };
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let response_time = Utc::now().with_timezone(&msk).to_rfc3339();
 
-        // Обновляем хранилище и возвращаем данные
+        // --- сбор метаданных ответа ---
+        let status = resp.status().as_u16();
+        let resp_headers: HashMap<_,_> = resp.headers()
+            .iter()
+            .map(|(k,v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let set_cookies: Vec<_> = resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .collect();
+
+        // обновляем collector (без чтения тела)
         {
             let mut coll = self.collector.lock().await;
-            if let Some(entry) = coll.get_mut(key) {
-                entry.response_data = Some(resp_data.clone());
-                entry.cookies = Some(self.dump_cookies()?);
+            if let Some(ent) = coll.get_mut(key) {
+                ent.response_data = Some(ResponseData {
+                    status,
+                    headers: resp_headers,
+                    body: String::new(),        // тело не логируем
+                    set_cookies,
+                    response_time: response_time.clone(),
+                    duration_ms,
+                });
+                ent.cookies = Some(self.dump_cookies()?);
             }
         }
-        Ok(resp_data)
+
+        // возвращаем оригинальный Response для дальнейшей обработки
+        Ok(resp)
     }
 
     pub async fn get_collected_data(&self) -> Result<String> {
@@ -290,7 +295,7 @@ impl TrackedClient {
 pub async fn example_step(client: &TrackedClient, step_id: &str) -> Result<()> {
     let builder = client.inner.get("https://httpbin.org/cookies/set?test=1");
     let resp = client.tracked_send(&format!("step_{}", step_id), builder).await?;
-    println!("Response status: {}", resp.status);
+    println!("Response status: {}", resp.status());
     let pretty = client.get_pretty_truncated_data().await?;
     println!("Collected: {}", pretty);
     client.clear_collector().await;
