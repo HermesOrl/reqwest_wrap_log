@@ -7,7 +7,7 @@ fn main() -> anyhow::Result<()> {
         let tracked_client = TrackedClient::new()?;
 
         // Цикл агрегатора (пример: несколько шагов)
-        for step in 1..=2 {
+        for step in 1..=1 {
             example_step(&tracked_client, &format!("step_{}", step)).await?;
         }
 

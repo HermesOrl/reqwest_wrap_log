@@ -324,11 +324,15 @@ impl TrackedClient {
 }
 
 pub async fn example_step(client: &TrackedClient, step_id: &str) -> Result<()> {
-    let builder = client.inner.get("https://httpbin.org/ip");
+    let mut map = HashMap::new();
+    map.insert("email", "sdfsdf".clone());
+    let builder = client.inner.get("https://httpbin.org/ip").form(&map);
     let resp = client.tracked_send(&format!("step_{}", step_id), builder).await?;
     println!("Response status: {}", resp.status());
     let pretty = client.get_pretty_truncated_data().await?;
+    let default = client.get_collected_data().await?;
     println!("Collected: {}", pretty);
+    println!("Collected2: {}", default);
     client.clear_collector().await;
     Ok(())
 }
