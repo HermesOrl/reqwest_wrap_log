@@ -48,7 +48,7 @@ pub struct RequestResponseData {
     pub error: Option<String>,
     pub cookies: Option<String>,
 }
-
+#[derive(Clone)]
 pub struct TrackedClient {
     pub inner: Client,
     pub collector: Arc<Mutex<HashMap<String, RequestResponseData>>>,
