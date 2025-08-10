@@ -1,4 +1,4 @@
-use reqwest::{Client, RequestBuilder, Proxy, Response};
+use reqwest::{Client, RequestBuilder, Proxy, Response, StatusCode};
 use reqwest_cookie_store::CookieStoreMutex;
 use cookie_store::CookieStore;
 use serde::{Deserialize, Serialize};
@@ -9,8 +9,9 @@ use std::time::Instant;
 use chrono::{Utc, FixedOffset};
 use std::io::Cursor;
 use anyhow::{anyhow, Context, Result};
+use reqwest::header::HeaderMap;
 use tokio::sync::Mutex;
-
+use bytes::Bytes;
 // Функция для усечения строки до max символов
 fn truncate(s: &str, max: usize) -> String {
     if s.len() > max {
@@ -151,27 +152,22 @@ impl TrackedClient {
 
     // теперь возвращает ResponseData для дальнейшего использования
     pub async fn tracked_send(&self, key: &str, builder: RequestBuilder) -> Result<Response> {
-        // === NEW: пробуем заранее сделать клон билдерa, чтобы потом вернуть «свежий» Response ===
-        let builder_for_return = builder.try_clone();
+        // НЕ делаем try_clone → второй запрос убран
+        // let builder_for_return = builder.try_clone();  // ← удалить
 
-        // --- подготовка RequestData как раньше ---
-        let mut req = builder
-            .build()
-            .context("Failed to build request")?;
+        // --- готовим RequestData (как было) ---
+        let mut req = builder.build().context("Failed to build request")?;
         let msk = FixedOffset::east_opt(3 * 3600).unwrap();
         let request_time = Utc::now().with_timezone(&msk).to_rfc3339();
         let method = req.method().as_str().to_string();
         let endpoint = req.url().to_string();
-        let headers: HashMap<_, _> = req
-            .headers()
+        let headers: HashMap<_, _> = req.headers()
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let body = req
-            .body()
-            .and_then(|b| b.as_bytes())
+        let body = req.body().and_then(|b| b.as_bytes())
             .map(|b| String::from_utf8_lossy(b).to_string());
-        // куки, отправленные в запросе
+
         let url = req.url().clone();
         let cookies_sent = {
             let store = self.cookie_store
@@ -181,6 +177,7 @@ impl TrackedClient {
                 .map(|c| (c.name().to_string(), c.value().to_string()))
                 .collect()
         };
+
         let req_data = RequestData { method, endpoint, headers, body, cookies: cookies_sent, request_time };
         {
             let mut coll = self.collector.lock().await;
@@ -195,12 +192,11 @@ impl TrackedClient {
             );
         }
 
-        // --- отправка и измерение времени ---
+        // --- единичный запрос ---
         let start = Instant::now();
         let resp = match self.inner.execute(req).await {
             Ok(r) => r,
             Err(e) => {
-                // залогируем ошибку
                 let mut coll = self.collector.lock().await;
                 if let Some(ent) = coll.get_mut(key) {
                     ent.error = Some(e.to_string());
@@ -211,57 +207,27 @@ impl TrackedClient {
         let duration_ms = start.elapsed().as_millis() as u64;
         let response_time = Utc::now().with_timezone(&msk).to_rfc3339();
 
-        // --- сбор метаданных ответа ---
         let status = resp.status().as_u16();
         let resp_headers: HashMap<_, _> = resp.headers()
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        let set_cookies: Vec<_> = resp
-            .headers()
+        let set_cookies: Vec<_> = resp.headers()
             .get_all("set-cookie")
             .iter()
             .filter_map(|v| v.to_str().ok().map(str::to_string))
             .collect();
 
-        // === NEW: если можем заново отправить такой же запрос — читаем body сейчас и логируем ===
-        if let Some(builder2) = builder_for_return {
-            // Читаем body для логирования
-            let body_bytes = resp.bytes().await.unwrap_or_default();
-            let body_string = String::from_utf8_lossy(&body_bytes).to_string();
-
-            {
-                let mut coll = self.collector.lock().await;
-                if let Some(ent) = coll.get_mut(key) {
-                    ent.response_data = Some(ResponseData {
-                        status,
-                        headers: resp_headers,
-                        body: body_string,
-                        set_cookies,
-                        response_time: response_time.clone(),
-                        duration_ms,
-                    });
-                    ent.cookies = Some(self.dump_cookies()?);
-                }
-            }
-
-            // Возвращаем «родной» Response вторым запросом (идемпотентные запросы — ОК)
-            let req2 = builder2.build().context("Failed to build cloned request")?;
-            let resp2 = self.inner.execute(req2).await
-                .context("Failed to re-execute request for returned Response")?;
-            return Ok(resp2);
-        }
-
-        // === Fallback (как раньше): не можем клонировать запрос — не читаем body, чтобы не сломать вызывающего ===
+        // ВНИМАНИЕ: тело НЕ читаем, чтобы не «съесть» поток у вызывающего
         {
             let mut coll = self.collector.lock().await;
             if let Some(ent) = coll.get_mut(key) {
                 ent.response_data = Some(ResponseData {
                     status,
                     headers: resp_headers,
-                    body: String::new(), // тут body НЕ читаем, иначе «съедим» поток
+                    body: String::new(),           // пусто: тело не трогаем
                     set_cookies,
-                    response_time: response_time.clone(),
+                    response_time,
                     duration_ms,
                 });
                 ent.cookies = Some(self.dump_cookies()?);
@@ -316,6 +282,98 @@ impl TrackedClient {
         truncate_fields(&mut data);
         serde_json::to_string_pretty(&data).context("Failed to serialize pretty truncated data")
     }
+    pub async fn tracked_send_text(&self, key: &str, builder: RequestBuilder) -> Result<LoggedText> {
+        use tokio::time::{timeout, Duration};
+
+        // Собираем request (как в tracked_send) + пишем request_data в collector
+        let mut req = builder.build().context("Failed to build request")?;
+        let msk = FixedOffset::east_opt(3 * 3600).unwrap();
+        let request_time = Utc::now().with_timezone(&msk).to_rfc3339();
+        let method = req.method().as_str().to_string();
+        let endpoint = req.url().to_string();
+        let headers_sent: HashMap<_, _> = req.headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let body_sent = req.body().and_then(|b| b.as_bytes())
+            .map(|b| String::from_utf8_lossy(b).to_string());
+
+        let url = req.url().clone();
+        let cookies_sent = {
+            let store = self.cookie_store
+                .lock()
+                .map_err(|e| anyhow!("Cookie store lock error: {}", e))?;
+            store.get_request_cookies(&url)
+                .map(|c| (c.name().to_string(), c.value().to_string()))
+                .collect()
+        };
+
+        {
+            let mut coll = self.collector.lock().await;
+            coll.insert(
+                key.to_string(),
+                RequestResponseData {
+                    request_data: RequestData {
+                        method, endpoint, headers: headers_sent, body: body_sent,
+                        cookies: cookies_sent, request_time
+                    },
+                    response_data: None,
+                    error: None,
+                    cookies: None,
+                },
+            );
+        }
+
+        // Один запрос + таймауты на execute и чтение тела
+        let start = Instant::now();
+        let resp = timeout(Duration::from_secs(20), self.inner.execute(req))
+            .await
+            .map_err(|_| anyhow!("timeout on execute"))?
+            .map_err(|e| {
+                // логируем ошибку
+                futures::executor::block_on(async {
+                    let mut coll = self.collector.lock().await;
+                    if let Some(ent) = coll.get_mut(key) { ent.error = Some(e.to_string()); }
+                });
+                anyhow!("Request execution failed: {}", e)
+            })?;
+
+        let status  = resp.status();
+        let headers = resp.headers().clone();
+        let body_bytes: Bytes = timeout(Duration::from_secs(25), resp.bytes())
+            .await
+            .map_err(|_| anyhow!("timeout on read body"))?
+            .context("read body failed")?;
+
+        let body_str = String::from_utf8_lossy(&body_bytes).to_string();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let response_time = Utc::now().with_timezone(&msk).to_rfc3339();
+
+        {
+            let mut coll = self.collector.lock().await;
+            if let Some(ent) = coll.get_mut(key) {
+                // Перекладываем в твой ResponseData для логов
+                let mut hdr_map: HashMap<String, String> = HashMap::new();
+                for (k, v) in headers.iter() {
+                    hdr_map.insert(k.to_string(), v.to_str().unwrap_or("").to_string());
+                }
+                let set_cookies: Vec<_> = headers.get_all("set-cookie")
+                    .iter().filter_map(|v| v.to_str().ok().map(str::to_string)).collect();
+
+                ent.response_data = Some(ResponseData {
+                    status: status.as_u16(),
+                    headers: hdr_map,
+                    body: body_str.clone(),
+                    set_cookies,
+                    response_time,
+                    duration_ms,
+                });
+                ent.cookies = Some(self.dump_cookies()?);
+            }
+        }
+
+        Ok(LoggedText { status, headers, body: body_str })
+    }
     pub async fn take_collected_data(&self) -> anyhow::Result<String> {
         let mut coll = self.collector.lock().await;
         let s = serde_json::to_string(&*coll)?;
@@ -341,5 +399,14 @@ pub async fn example_step(client: &TrackedClient, step_id: &str) -> Result<()> {
     println!("Collected2: {}", default);
     client.clear_collector().await;
     Ok(())
+}
+
+
+
+
+pub struct LoggedText {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: String,
 }
 
