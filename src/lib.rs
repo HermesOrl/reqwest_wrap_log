@@ -316,6 +316,12 @@ impl TrackedClient {
         truncate_fields(&mut data);
         serde_json::to_string_pretty(&data).context("Failed to serialize pretty truncated data")
     }
+    pub async fn take_collected_data(&self) -> anyhow::Result<String> {
+        let mut coll = self.collector.lock().await;
+        let s = serde_json::to_string(&*coll)?;
+        coll.clear();
+        Ok(s)
+    }
 
     pub async fn clear_collector(&self) {
         let mut coll = self.collector.lock().await;
