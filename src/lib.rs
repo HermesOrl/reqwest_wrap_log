@@ -1,4 +1,4 @@
-use reqwest::{Client, RequestBuilder, Proxy, Response, StatusCode};
+use reqwest::{Client, RequestBuilder, Proxy, Response, StatusCode, Url};
 use reqwest_cookie_store::CookieStoreMutex;
 use cookie_store::CookieStore;
 use serde::{Deserialize, Serialize};
@@ -291,10 +291,15 @@ impl TrackedClient {
         let request_time = Utc::now().with_timezone(&msk).to_rfc3339();
         let method = req.method().as_str().to_string();
         let endpoint = req.url().to_string();
+
+        // исходный URL до редиректов
+        let orig_url: url::Url = req.url().clone();
+
         let headers_sent: HashMap<_, _> = req.headers()
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
+
         let body_sent = req.body().and_then(|b| b.as_bytes())
             .map(|b| String::from_utf8_lossy(b).to_string());
 
@@ -330,7 +335,6 @@ impl TrackedClient {
             .await
             .map_err(|_| anyhow!("timeout on execute"))?
             .map_err(|e| {
-                // логируем ошибку
                 futures::executor::block_on(async {
                     let mut coll = self.collector.lock().await;
                     if let Some(ent) = coll.get_mut(key) { ent.error = Some(e.to_string()); }
@@ -338,8 +342,12 @@ impl TrackedClient {
                 anyhow!("Request execution failed: {}", e)
             })?;
 
+        // конечный URL после возможных редиректов — фиксируем СРАЗУ, пока resp не потреблён
+        let final_url: url::Url = resp.url().clone();
+
         let status  = resp.status();
         let headers = resp.headers().clone();
+
         let body_bytes: Bytes = timeout(Duration::from_secs(25), resp.bytes())
             .await
             .map_err(|_| anyhow!("timeout on read body"))?
@@ -352,13 +360,16 @@ impl TrackedClient {
         {
             let mut coll = self.collector.lock().await;
             if let Some(ent) = coll.get_mut(key) {
-                // Перекладываем в твой ResponseData для логов
                 let mut hdr_map: HashMap<String, String> = HashMap::new();
                 for (k, v) in headers.iter() {
                     hdr_map.insert(k.to_string(), v.to_str().unwrap_or("").to_string());
                 }
                 let set_cookies: Vec<_> = headers.get_all("set-cookie")
                     .iter().filter_map(|v| v.to_str().ok().map(str::to_string)).collect();
+
+                // если не хочешь править схемы логов — можно просто добавить final_url в headers
+                hdr_map.insert("x-final-url".into(), final_url.as_str().to_string());
+                hdr_map.insert("x-orig-url".into(), orig_url.as_str().to_string());
 
                 ent.response_data = Some(ResponseData {
                     status: status.as_u16(),
@@ -372,7 +383,15 @@ impl TrackedClient {
             }
         }
 
-        Ok(LoggedText { status, headers, body: body_str })
+        let redirected = final_url != orig_url;
+
+        Ok(LoggedText {
+            status,
+            headers,
+            body: body_str,
+            final_url,
+            redirected,
+        })
     }
     pub async fn take_collected_data(&self) -> anyhow::Result<String> {
         let mut coll = self.collector.lock().await;
@@ -408,5 +427,6 @@ pub struct LoggedText {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: String,
+    pub final_url: Url,      // ← добавили
+    pub redirected: bool,    // ← опционально, удобно иметь
 }
-
